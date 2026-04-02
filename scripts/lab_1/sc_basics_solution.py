@@ -50,9 +50,24 @@
 # ## Library imports
 
 # %%
+from natsort import natsorted
+
+import numpy as np
+import pandas as pd
+import scipy
+from igraph import Graph
+from scipy.sparse import csr_matrix
+from scipy.stats import false_discovery_control, ttest_ind
+from sklearn.decomposition import PCA
+from statsmodels.nonparametric.smoothers_lowess import lowess
+from umap import UMAP
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
 import scanpy as sc
 
-from qibs2026 import DATA_DIR  # noqa
+from qibs2026 import DATA_DIR
 
 # %% [markdown]
 # ## General settings
@@ -60,6 +75,10 @@ from qibs2026 import DATA_DIR  # noqa
 # %%
 sc.settings.verbosity = 2
 sc.set_figure_params(frameon=False, transparent=True)
+
+# %%
+sns.set_style("ticks")
+plt.rc("axes.spines", top=False, right=False)
 
 # %% [markdown]
 # ## Constants
@@ -94,6 +113,24 @@ DATASET_ID = "lab_1"
 
 # %%
 # Implement your solution here
+obs_data = pd.read_csv(
+    DATA_DIR / DATASET_ID / "raw" / "filtered_feature_bc_matrix" / "barcodes.tsv.gz",
+    compression="gzip",
+    sep="\t",
+    header=None,
+    names=["Cell_Barcode"],
+    index_col=0,
+)
+
+var_data = pd.read_csv(
+    DATA_DIR / DATASET_ID / "raw" / "filtered_feature_bc_matrix" / "features.tsv.gz",
+    compression="gzip",
+    sep="\t",
+    header=None,
+    names=["ensembl_id", "hgnc_id", "feature_types"],
+)
+
+counts = scipy.io.mmread(DATA_DIR / DATASET_ID / "raw" / "filtered_feature_bc_matrix" / "matrix.mtx.gz").T
 
 # %% [markdown]
 # <div style="padding: 10px; border-radius: 1px; width: 98%">
@@ -105,6 +142,8 @@ DATASET_ID = "lab_1"
 
 # %%
 # Implement your solution here
+adata = sc.read_10x_mtx(DATA_DIR / DATASET_ID / "raw" / "filtered_feature_bc_matrix")
+adata
 
 # %% [markdown]
 # ## 2. Data overview
@@ -116,15 +155,25 @@ DATASET_ID = "lab_1"
 #   </div>
 #   <ol type="a">
 #     <li>How many cells does the data include?</li>
+#     <blockquote>8000</blockquote>
 #     <li>What format is the count data saved as and why?</li>
+#     <blockquote>Sparse format since there are only 1.45% non-zero values.</blockquote>
 #   </ol>
 # </div>
 
 # %%
 # Implement your solution here (using `counts`)
+print(f"Number of cells: {counts.shape[0]}")
+
+print(f"Data type of counts array: {type(counts)}")
+print(f"Percent of non-zero counts: {counts.nnz / counts.shape[0] / counts.shape[1] * 100:.2f}%")
 
 # %%
 # Implement your solution here (using `adata`)
+print(f"Number of cells: {adata.n_obs}")
+
+print(f"Data type of adata.X: {type(adata.X)}")
+print(f"Percent of non-zero counts: {adata.X.nnz / adata.n_obs / adata.n_vars * 100:.2f}%")
 
 # %% [markdown]
 # <div style="padding: 10px; border-radius: 1px; width: 98%">
@@ -139,9 +188,15 @@ DATASET_ID = "lab_1"
 
 # %%
 # Implement your solution here (using `counts`)
+counts = csr_matrix(counts)
+
+assert np.issubdtype(counts.data.dtype, int)
 
 # %%
 # Implement your solution here (using `adata`)
+adata.X = csr_matrix(adata.X)
+
+np.testing.assert_array_equal(adata.X.data, adata.X.data.astype(int))
 
 # %% [markdown]
 # <div style="padding: 10px; border-radius: 1px; width: 98%">
@@ -157,10 +212,15 @@ DATASET_ID = "lab_1"
 #     <b>Question 2.2</b>
 #   </div>
 #   <p>How many gene names are duplicated?</p>
+#   <blockquote>10</blockquote>
 # </div>
 
 # %%
 # Implement your solution here
+row_mask = var_data["hgnc_id"].duplicated().values
+print(f"Number of duplicate gene names: {row_mask.sum()}")
+
+var_data.loc[row_mask, :]
 
 # %% [markdown]
 # <div style="padding: 10px; border-radius: 1px; width: 98%">
@@ -172,6 +232,10 @@ DATASET_ID = "lab_1"
 
 # %%
 # Implement your solution here
+var_mask = adata.var_names.duplicated()
+print(f"Number of duplicate gene names: {var_mask.sum()}")
+
+adata.var.loc[row_mask, :]
 
 # %% [markdown]
 # <div style="padding: 10px; border-radius: 1px; width: 98%">
@@ -182,7 +246,14 @@ DATASET_ID = "lab_1"
 # </div>
 
 # %%
-# Implement your solution here
+var_data.loc[row_mask, "hgnc_id"] = adata.var_names[row_mask].copy()
+print(f"Number of duplicate gene names: {var_data['hgnc_id'].duplicated().sum()}")
+assert adata.var_names.equals(pd.Index(var_data["hgnc_id"].values))
+
+var_data = var_data.set_index("hgnc_id")
+var_data.index.name = None
+
+var_data.loc[row_mask, :]
 
 # %% [markdown]
 # ## 3. Quality control
@@ -203,6 +274,9 @@ DATASET_ID = "lab_1"
 
 # %%
 # Implement your solution here (cell filter)
+row_mask = counts.sum(axis=1).A1 >= 100
+counts = counts[row_mask, :].copy()
+obs_data = obs_data.loc[row_mask, :].copy()
 
 # %% [markdown]
 # <div style="padding: 10px; border-radius: 1px; width: 98%">
@@ -211,7 +285,9 @@ DATASET_ID = "lab_1"
 #   </div>
 #   <ol type="a">
 #     <li>How many genes are not expressed?</li>
+#     <blockquote>11775</blockquote>
 #     <li>How many genes are expressed but in less than 10 cells?</li>
+#     <blockquote>9595</blockquote>
 #   </ol>
 # </div>
 #
@@ -224,6 +300,15 @@ DATASET_ID = "lab_1"
 
 # %%
 # Implement your solution here (gene filter)
+n_cells_per_genes = counts.getnnz(axis=0)
+print(f"Number of genes not expressed: {(n_cells_per_genes == 0).sum()}")
+print(
+    f"Number of genes expressed but in less than 10 cells: {(n_cells_per_genes < 10).sum() - (n_cells_per_genes == 0).sum()}"
+)
+
+col_mask = n_cells_per_genes >= 10
+counts = counts[:, col_mask].copy()
+var_data = var_data.loc[col_mask, :].copy()
 
 # %% [markdown]
 # ### Cell-specific quality control metrics
@@ -250,13 +335,25 @@ DATASET_ID = "lab_1"
 #     <b>Question 3.2</b>
 #   </div>
 #   <p>Why is a canonical log-transformation inadmissible for single-cell data?</p>
+#
+#   <blockquote>
+#   scRNA-seq data contains zero values, but the domain of the log are only positive real values. Adding a pseudocount of 1 before logarithmizing (1) allows us to log-transforms the data, and (2) maps zero to zero, i.e., allows for working with sparse matrices even after the transformation.
+#   </blockquote>
 # </div>
 
 # %%
 # Implement your solution here (library size)
+obs_data["total_counts"] = counts.sum(axis=1).A1
+obs_data["log1p_total_counts"] = np.log1p(obs_data["total_counts"])
+
+print(f"Median library size: {np.median(obs_data['total_counts'])}")
 
 # %%
 # Implement your solution here (number of genes per cell)
+obs_data["n_genes_by_counts"] = (counts > 0).sum(axis=1).A1
+obs_data["log1p_n_genes_by_counts"] = np.log1p(obs_data["n_genes_by_counts"])
+
+print(f"Median number of genes per cell: {np.median(obs_data['n_genes_by_counts'])}")
 
 # %% [markdown]
 # Additional important QC metrics are the total fraction of the transcripts that are ribosomal RNAs or that attributed to the mitochondrial genome: mitochondrial fraction has been show to increase in dead or dying cells [(Azizi et al. 2018)](https://pubmed.ncbi.nlm.nih.gov/29961579/); high fractions of ribosomal RNA entail less coverage of the for us relevant mRNA.
@@ -274,9 +371,21 @@ DATASET_ID = "lab_1"
 
 # %%
 # Implement your solution here (mitochondrial genes)
+var_mask = var_data.index.str.startswith("MT-")
+var_data["mito"] = var_mask
+
+obs_data["total_counts_mito"] = counts[:, var_mask].sum(axis=1).A1
+obs_data["log1p_total_counts_mito"] = np.log1p(obs_data["total_counts_mito"])
+obs_data["pct_counts_mito"] = counts[:, var_mask].sum(axis=1).A1 / obs_data["total_counts"] * 100
 
 # %%
 # Implement your solution here (ribosomal genes)
+var_mask = var_data.index.str.startswith(("RPS", "RPL"))
+var_data["ribo"] = var_mask
+
+obs_data["total_counts_ribo"] = counts[:, var_mask].sum(axis=1).A1
+obs_data["log1p_total_counts_ribo"] = np.log1p(obs_data["total_counts_ribo"])
+obs_data["pct_counts_ribo"] = counts[:, var_mask].sum(axis=1).A1 / obs_data["total_counts"] * 100
 
 # %% [markdown]
 # <div style="padding: 10px; border-radius: 1px; width: 98%">
@@ -286,14 +395,29 @@ DATASET_ID = "lab_1"
 #
 #   <ol type="a">
 #     <li>How many mitochondiral genes does the data include?</li>
+#     <blockquote>13</blockquote>
 #     <li>What is the highest mitochondrial percentage (rounded to two decimals)? Report the corresponding cell barcode.</li>
+#     <blockquote>95.43% (GTGAGGACATGAGAAT-1)</blockquote>
 #     <li>How many ribosomal genes does the data include?</li>
+#     <blockquote>94</blockquote>
 #     <li>What is the highest ribosomal percentage (rounded to two decimals)? Report the corresponding cell barcode.</li>
+#     <blockquote>65.44% (GTAGAAAAGTGCTAGG-1)</blockquote>
 #   </ol>
 # </div>
 
 # %%
 # Implement your solution here
+print(f"Number of mitochondrial genes: {var_data['mito'].sum()}")
+print(
+    f"Highest mitochondrial percentage: {obs_data['pct_counts_mito'].max():.2f} "
+    f"(barcode: {obs_data['pct_counts_mito'].idxmax()})"
+)
+
+print(f"Number of ribosomal genes: {var_data['ribo'].sum()}")
+print(
+    f"Highest mitochondrial percentage: {obs_data['pct_counts_ribo'].max():.2f} "
+    f"(barcode: {obs_data['pct_counts_ribo'].idxmax()})"
+)
 
 # %% [markdown]
 # ### Gene-specific quality control metrics
@@ -318,19 +442,30 @@ DATASET_ID = "lab_1"
 #   </div>
 #
 #   Which gene has the highest mean expression?
+#   <blockquote>
+#     MALAT1.
+#     <br>Fun Fact: this will be the case for nearly every single-cell dataset you work with! MALAT1 is a long non-coding RNA that is notorious for extremely high capture in 10X scRNA-seq datasets. It is thought to be a spurious technical artifact, hence it is often removed from analysis. The same applies to NEAT1, which you can see is also among the most highly-expressed genes here.
+#   </blockquote>
 # </div>
 
 # %%
 # Implement your solution here (n_cells_by_counts)
+var_data["n_cells_by_counts"] = counts.getnnz(axis=0)
 
 # %%
 # Implement your solution here (mean GEX)
+var_data["mean_counts"] = counts.mean(axis=0).A1
+var_data["log1p_mean_counts"] = np.log1p(var_data["mean_counts"])
+var_data.iloc[var_data["mean_counts"].argmax(), :].loc[["ensembl_id"]]
 
 # %%
 # Implement your solution here (dropout percentage)
+var_data["pct_dropout_by_counts"] = 100 - counts.getnnz(axis=0) / counts.shape[0] * 100
 
 # %%
 # Implement your solution here (total counts)
+var_data["total_counts"] = counts.sum(axis=0).A1
+var_data["log1p_total_counts"] = np.log1p(var_data["total_counts"])
 
 # %% [markdown]
 # <div style="padding: 10px; border-radius: 1px; width: 98%">
@@ -346,9 +481,34 @@ DATASET_ID = "lab_1"
 
 # %%
 # Implement your solution here (single-QC plots)
+fig, ax = plt.subplots(ncols=2, figsize=(12, 4), sharey=True)
+
+sns.histplot(data=obs_data, x="log1p_total_counts", bins=50, kde=True, ax=ax[0])
+ax[0].set_title("log1p(library size)")
+
+sns.histplot(data=obs_data, x="log1p_n_genes_by_counts", bins=50, kde=True, ax=ax[1])
+ax[1].set_title("log1p(number of genes per cell)")
+
+fig, ax = plt.subplots(ncols=2, figsize=(12, 4), sharey=True)
+
+sns.histplot(data=obs_data, x="pct_counts_mito", bins=50, kde=True, ax=ax[0])
+ax[0].set_title("Percentage of mitochondrial counts")
+
+sns.histplot(data=obs_data, x="pct_counts_ribo", bins=50, kde=True, ax=ax[1])
+ax[1].set_title("Percentage of ribosomal counts")
+
+plt.show()
 
 # %%
 # Implement your solution here (QC metrics plotted against each other)
+fig, ax = plt.subplots(figsize=(6, 4))
+sns.scatterplot(data=obs_data, x="total_counts", y="pct_counts_mito", s=10, color="grey", ax=ax)
+ax.set(xlabel="Total counts per cell", ylabel="Mitochondrial count percentage")
+
+fig, ax = plt.subplots(figsize=(6, 4))
+sns.scatterplot(data=obs_data, x="total_counts", y="n_genes_by_counts", s=10, color="grey", ax=ax)
+ax.set(xlabel="Total counts per cell", ylabel="Number of genes per cell")
+plt.show()
 
 # %% [markdown]
 # We can use the plots visualizing the relationship between mitochondrial count percentage and number of genes per cell versus the total counts per cell, respectively, to identify outlier cells. Specifically, we are looking for cell with
@@ -371,10 +531,18 @@ DATASET_ID = "lab_1"
 #   </div>
 #
 #   What is the dimension of our dataset after filtering?
+#   <blockquote>4990 cells and 15231 genes.</blockquote>
 # </div>
 
 # %%
 # Implement your solution here
+row_mask = (obs_data["total_counts"] < 60000) & (obs_data["pct_counts_mito"] < 20)
+row_mask = row_mask.values
+counts = counts[row_mask, :].copy()
+obs_data = obs_data.loc[row_mask, :].copy()
+
+print(f"Number of cells: {counts.shape[0]}")
+print(f"Number of genes: {counts.shape[1]}")
 
 # %% [markdown]
 # As a final step, we will perform the same analysis using Scanpy directly.
@@ -394,6 +562,17 @@ DATASET_ID = "lab_1"
 
 # %%
 # Implement your solution here (Scanpy-based workflow)
+sc.pp.filter_cells(adata, min_counts=100)
+sc.pp.filter_genes(adata, min_cells=10)
+
+adata.var["mito"] = adata.var_names.str.upper().str.startswith("MT-")
+adata.var["ribo"] = adata.var_names.str.upper().str.startswith(("RPS", "RPL"))
+sc.pp.calculate_qc_metrics(adata, qc_vars=["mito", "ribo"], percent_top=(), log1p=True, inplace=True)
+
+obs_mask = (adata.obs["total_counts"] < 60000) & (adata.obs["pct_counts_mito"] < 20)
+adata = adata[obs_mask, :].copy()
+
+adata
 
 # %% [markdown]
 # ## 4. Data preprocessing
@@ -416,9 +595,12 @@ DATASET_ID = "lab_1"
 
 # %%
 # Implement your solution here (normalization)
+normalized_counts = counts / counts.sum(axis=1).reshape(-1, 1) * np.median(counts.sum(axis=1).A1)
+normalized_counts = csr_matrix(normalized_counts)
 
 # %%
 # Implement your solution here (log1p-transformation)
+log1p_normalized_counts = np.log1p(normalized_counts)
 
 # %% [markdown]
 # <div style="padding: 10px; border-radius: 1px; width: 98%">
@@ -438,10 +620,14 @@ DATASET_ID = "lab_1"
 #   </div>
 #
 #   How can you keep track of whether or not your data is log1p-transformed in an AnnData-Scanpy-based workflow?
+#   <blockquote>Calling <code>scanpy.pp.log1p</code> adds an entry <i>log1p</i> to the <code>uns</code> slot.</blockquote>
 # </div>
 
 # %%
 # Implement your solution here
+adata.layers["counts"] = adata.X.copy()
+sc.pp.normalize_total(adata)
+sc.pp.log1p(adata)
 
 # %% [markdown]
 # We will not z-score our data here, but it is an optional step to be aware of: in some cases, we want to scale each gene to zero mean and a standard deviation of 1. Such a transformation can also dramatically change the structure of your data.
@@ -473,12 +659,26 @@ DATASET_ID = "lab_1"
 
 # %%
 # Implement your solution here (mean, standard deviation, and dispersion)
+mean = log1p_normalized_counts.mean(axis=0).A1
+mean[mean == 0] = 1e-12
+
+var = log1p_normalized_counts.power(2).mean(axis=0).A1 - mean**2
+dispersion = var / mean
 
 # %%
 # Implement your solution here (model fit and residual computation)
+predicted_log_dispersion = lowess(np.log(dispersion), np.log(mean), return_sorted=False)
+residuals = np.log(dispersion) - predicted_log_dispersion
 
 # %%
 # Implement your solution here (plotting)
+fig, ax = plt.subplots(figsize=(6, 6))
+
+sns.scatterplot(x=np.log(mean), y=np.log(dispersion), s=2, c=residuals, edgecolor=None, ax=ax)
+sns.lineplot(x=np.log(mean), y=predicted_log_dispersion, color="black", ax=ax)
+ax.set(title="HVG selection", xlabel="log(mean GEX)", ylabel="log(dispersion)", aspect="equal")
+
+plt.show()
 
 # %% [markdown]
 # <div style="padding: 10px; border-radius: 1px; width: 98%">
@@ -494,10 +694,13 @@ DATASET_ID = "lab_1"
 #   </div>
 #
 #   What are the 5 most highly variable genes?
+#   <blockquote>HBA1, HBG2, HBB, HBA2, LINC01534</blockquote>
 # </div>
 
 # %%
 # Implement your solution here (plotting)
+hvgs = var_data.index[np.argsort(residuals)[-1000:]]
+hvgs[-5:]
 
 # %% [markdown]
 # <div style="padding: 10px; border-radius: 1px; width: 98%">
@@ -509,7 +712,7 @@ DATASET_ID = "lab_1"
 # </div>
 
 # %%
-# Implement your solution here
+sc.pp.highly_variable_genes(adata, n_top_genes=2000)
 
 # %% [markdown]
 # <div style="padding: 10px; border-radius: 1px; width: 98%">
@@ -521,6 +724,14 @@ DATASET_ID = "lab_1"
 
 # %%
 # Implement your solution here
+hvgs = adata.var_names[adata.var["highly_variable"]]
+var_data["highly_variable"] = var_data.index.isin(hvgs)
+
+var_mask = var_data["highly_variable"].values
+var_data = var_data.loc[var_mask, :].copy()
+counts = counts[:, var_mask].copy()
+normalized_counts = normalized_counts[:, var_mask].copy()
+log1p_normalized_counts = log1p_normalized_counts[:, var_mask].copy()
 
 # %% [markdown]
 # ## Dimensionality reduction
@@ -548,13 +759,28 @@ DATASET_ID = "lab_1"
 #   </div>
 #
 #   What is a reasonable number of principal components to choose?
+#   <blockquote>30</blockquote>
 # </div>
 
 # %%
 # Implement your solution here (PC computation)
+pca = PCA(n_components=50)
+pcs = pca.fit_transform(log1p_normalized_counts)
 
 # %%
 # Implement your solution here (plotting)
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.plot(
+    np.arange(pca.n_components) + 1,
+    pca.explained_variance_ratio_,
+    marker="o",
+    linestyle="--",
+    color="black",
+    markerfacecolor="none",
+    markeredgecolor="black",
+)
+ax.set(xlabel="Number of components", ylabel="Explained variance")
+plt.show()
 
 # %% [markdown]
 # <div style="padding: 10px; border-radius: 1px; width: 98%">
@@ -566,6 +792,8 @@ DATASET_ID = "lab_1"
 
 # %%
 # Implement your solution here (plotting)
+n_pcs = 30
+pcs = pcs[:, :n_pcs]
 
 # %% [markdown]
 # <div style="padding: 10px; border-radius: 1px; width: 98%">
@@ -577,6 +805,7 @@ DATASET_ID = "lab_1"
 
 # %%
 # Implement your solution here (plotting)
+sc.pp.pca(adata, n_comps=n_pcs)
 
 # %% [markdown]
 # ### UMAP
@@ -602,9 +831,18 @@ DATASET_ID = "lab_1"
 
 # %%
 # Implement your solution here (plotting) (umap coordinates)
+umap_model = UMAP(min_dist=0.5, n_neighbors=30)
+obs_data[["umap_1", "umap_2"]] = umap_model.fit_transform(pcs)
 
 # %%
 # Implement your solution here (plotting)
+fig, ax = plt.subplots(figsize=(6, 6))
+
+sns.scatterplot(data=obs_data, x="umap_1", y="umap_2", s=20, c="#D3D3D3", edgecolor=None, ax=ax)
+ax.set_title("UMAP")
+ax.axis("off")
+
+plt.show()
 
 # %% [markdown]
 # <div style="padding: 10px; border-radius: 1px; width: 98%">
@@ -619,9 +857,16 @@ DATASET_ID = "lab_1"
 
 # %%
 # Implement your solution here (neighbor graph and umap embedding)
+sc.pp.neighbors(adata, n_neighbors=30)
+sc.tl.umap(adata, min_dist=0.5)
 
 # %%
 # Implement your solution here (plotting)
+fig = sc.pl.embedding(adata, basis="umap", size=20, add_outline=2, return_fig=True)
+fig.set_size_inches(6, 6)
+ax = fig.get_axes()
+ax[0].set(title="UMAP")
+plt.show()
 
 # %% [markdown]
 # ## Cell typing
@@ -647,16 +892,38 @@ DATASET_ID = "lab_1"
 
 # %%
 # Implement your solution here (igraph graph definition)
+adjacency = adata.obsp["connectivities"].copy()
+adjacency.eliminate_zeros()
+sources, targets = adjacency.nonzero()
+
+graph = Graph(directed=False)
+graph.add_vertices(adjacency.shape[0])
+graph.add_edges(list(zip(sources, targets, strict=True)))
+
+graph.es["weight"] = adjacency.data
 
 # %%
 # Implement your solution here (leiden clustering)
-from scanpy._utils.random import set_igraph_random_state  # isort: skip # noqa
+from scanpy._utils.random import set_igraph_random_state  # isort: skip # noqa: E402
 
-# Use the context `with set_igraph_random_state(0):`
+with set_igraph_random_state(0):
+    partition = graph.community_leiden(weights="weight", resolution=1, objective_function="modularity")
+
+groups = np.array(partition.membership, dtype="U")
+obs_data["leiden"] = pd.Categorical(values=groups, categories=natsorted(map(str, np.unique(groups))))
 
 # %%
 # Implement your solution here (plotting)
-from scanpy.plotting.palettes import vega_20_scanpy  # isort: skip # noqa
+from scanpy.plotting.palettes import vega_20_scanpy  # isort: skip # noqa: E402
+
+fig, ax = plt.subplots(figsize=(6, 6))
+
+palette = dict(zip(obs_data["leiden"].cat.categories, vega_20_scanpy, strict=False))
+sns.scatterplot(data=obs_data, x="umap_1", y="umap_2", s=20, hue="leiden", palette=palette, edgecolor=None, ax=ax)
+ax.set_title("UMAP")
+ax.axis("off")
+
+plt.show()
 
 # %% [markdown]
 # <div style="padding: 10px; border-radius: 1px; width: 98%">
@@ -668,6 +935,20 @@ from scanpy.plotting.palettes import vega_20_scanpy  # isort: skip # noqa
 
 # %%
 # Implement your solution here (leiden clustering)
+sc.tl.leiden(adata, flavor="igraph")
+
+fig = sc.pl.embedding(
+    adata,
+    basis="umap",
+    color="leiden",
+    size=20,
+    add_outline=2,
+    legend_loc="on data",
+    legend_fontoutline=2,
+    return_fig=True,
+)
+fig.set_size_inches(6, 6)
+plt.show()
 
 # %% [markdown]
 # <div style="padding: 10px; border-radius: 1px; width: 98%">
@@ -679,6 +960,9 @@ from scanpy.plotting.palettes import vega_20_scanpy  # isort: skip # noqa
 
 # %%
 # Implement your solution here (leiden clustering)
+precomuted_leiden = pd.read_parquet(DATA_DIR / DATASET_ID / "results" / "leiden.parquet")
+obs_data["leiden"] = precomuted_leiden.loc[obs_data.index, "leiden"]
+adata.obs["leiden"] = precomuted_leiden.loc[adata.obs_names, "leiden"]
 
 # %% [markdown]
 # Finally, to associate the identified clusters with biology, we identify genes differentially expressed in each cluster compared to the rest of the data, ultimatly allowing us to assign cell type labels to these clusters, for example, by studying the expression of known markers in across the clusters.
@@ -699,15 +983,27 @@ from scanpy.plotting.palettes import vega_20_scanpy  # isort: skip # noqa
 #   </div>
 #   <ol>
 #     <li>How many genes are significantly enriched in leiden cluster 1 at a false discover rate of 0.05?</li>
+#     <blockquote>26</blockquote>
 #     <li>Which are the three most differentially enriched genes?</li>
+#     <blockquote>HBA2, HBB, HBA1</blockquote>
 #   </ol>
 # </div>
 
 # %%
-# Implement your solution here
+obs_mask = obs_data["leiden"].isin(["1"]).values
+group_1 = log1p_normalized_counts[obs_mask, :].toarray()
+group_2 = log1p_normalized_counts[~obs_mask, :].toarray()
+
+res = ttest_ind(group_1, group_2, equal_var=False)
+res = pd.DataFrame({"names": var_data.index, "scores": res.statistic, "pvals": res.pvalue})
+res["padj"] = false_discovery_control(res["pvals"].values)
+res = res.sort_values("scores", ascending=False, ignore_index=True)
+res.head()
 
 # %%
-# Implement your solution here
+n_degs = ((res["padj"] < 0.05) & (res["scores"] > 0)).sum()
+print(f"Number of enriched DEGs: {n_degs}.")
+print(f"Most DEGs: {', '.join(res['names'].values[:3])}")
 
 # %% [markdown]
 # <div style="padding: 10px; border-radius: 1px; width: 98%">
@@ -718,21 +1014,22 @@ from scanpy.plotting.palettes import vega_20_scanpy  # isort: skip # noqa
 # </div>
 
 # %%
-# Implement your solution here
+sc.tl.rank_genes_groups(adata, groupby="leiden", mask_var="highly_variable")
+deg_res = sc.get.rank_genes_groups_df(adata, group="1")
+deg_res.head()
 
 # %% [markdown]
 # `scanpy.pl.rank_genes_groups_dotplot` enables studying the expression of a set of given genes in the indentified Leiden cluster systematically: for each gene, the dot size indicates how many cells in a given group express a given gene, and the color of the dot encodes the group-specific mean expression. Here, we can see that cells in cluster 1 are likely Eryhtrocytes, and cells in cluster 7 T cells, for example.
 
 # %%
-# Uncomment to visualize the GEX using the dotplot
-# sc.pl.rank_genes_groups_dotplot(
-#     adata,
-#     var_names={
-#         "T": ["CD4", "CD8A", "CD3D"],
-#         "B": ["CD79A"],
-#         "Neutrophil": ["FCGR3B"],
-#         "Monocyte": ["CD14"],
-#         "Erythrocyte": ["HBA1", "HBA2", "HBB"],
-#     },
-#     standard_scale="var",
-# )
+sc.pl.rank_genes_groups_dotplot(
+    adata,
+    var_names={
+        "T": ["CD4", "CD8A", "CD3D"],
+        "B": ["CD79A"],
+        "Neutrophil": ["FCGR3B"],
+        "Monocyte": ["CD14"],
+        "Erythrocyte": ["HBA1", "HBA2", "HBB"],
+    },
+    standard_scale="var",
+)
